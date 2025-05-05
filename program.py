@@ -6,14 +6,29 @@ import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import time
+import numpy as np
 
 import mne
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import numpy as np
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
+
+# --- Custom HMM class enforcing a transition mask ---
+class ConstrainedGaussianHMM(hmm.GaussianHMM):
+    def __init__(self, mask, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mask = mask
+
+    def _do_mstep(self, stats):
+        # Perform the normal maximization step.
+        super()._do_mstep(stats)
+        # Then enforce transition constraints.
+        self.transmat_ *= self.mask
+        row_sums = self.transmat_.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1e-10
+        self.transmat_ = self.transmat_ / row_sums
 
 # --- Redirect sys.stdout and sys.stderr to the GUI log widget ---
 class ConsoleRedirector:
@@ -28,7 +43,7 @@ class ConsoleRedirector:
     def flush(self):
         pass
 
-# --- Custom logging handler to send logging messages to the text widget ---
+# --- Custom logging handler to send messages to the text widget ---
 class TextHandler(logging.Handler):
     def __init__(self, widget):
         super().__init__()
@@ -68,9 +83,12 @@ class EEGAnalysisGUI(tk.Tk):
         self.ica_exclusion_result = None
         self.ica_for_exclusion = None  # To store the ICA instance
         
+        # Option for HMM model: "constrained" or "unconstrained".
+        self.hmm_option = tk.StringVar(value="constrained")
+        
         self.create_widgets()
         self.setup_logging()
-        # Bind a virtual event to show the ICA exclusion dialog.
+        # Bind virtual event for ICA exclusion.
         self.bind("<<ShowExclusion>>", self.handle_show_exclusion)
     
     def setup_logging(self):
@@ -85,20 +103,53 @@ class EEGAnalysisGUI(tk.Tk):
         text_handler.setFormatter(formatter)
         logger = logging.getLogger()
         logger.addHandler(text_handler)
-        # Set our own logging level; you can adjust this (e.g. level INFO)
         logger.setLevel(logging.INFO)
-
-        # Set noisy module loggers to WARNING.
+        
+        # Suppress noisy modules.
         logging.getLogger("matplotlib").setLevel(logging.WARNING)
         logging.getLogger("PIL").setLevel(logging.WARNING)
         logging.getLogger("joblib").setLevel(logging.WARNING)
     
+    def switch_hmm_model(self):
+        """Switch between constrained and unconstrained HMM without rerunning analysis."""
+        n_emotional_states = 3
+
+        if self.features_scaled is None:
+            messagebox.showerror("Error", "No extracted features found. Please run analysis first.")
+            return
+
+        if self.hmm_option.get() == "constrained":
+            mask = np.array([[0, 1, 1], [1, 0, 0], [1, 0, 0]])
+            self.thread_safe_log("Switching to constrained HMM")
+            self.model = ConstrainedGaussianHMM(mask, n_components=n_emotional_states,
+                                                covariance_type="full", n_iter=400, random_state=37)
+        else:
+            self.thread_safe_log("Switching to unconstrained HMM.")
+            self.model = hmm.GaussianHMM(n_components=n_emotional_states,
+                                        covariance_type="full", n_iter=400, random_state=37)
+
+        self.model.fit(self.features_scaled)
+        self.hidden_states = self.model.predict(self.features_scaled)
+        self.thread_safe_log(f"Updated hidden state indices: {self.hidden_states}")
+
+        # Refresh the interval display
+        self.show_interval(self.current_interval_index)
+
     def create_widgets(self):
-        # Top frame: file selection & analysis button.
+        # Top frame: File selection, radio buttons for HMM option, and analysis button.
         top_frame = tk.Frame(self)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
         btn = tk.Button(top_frame, text="Load Files and Run Analysis", command=self.load_and_run_analysis)
         btn.pack(side=tk.LEFT)
+        
+        # Add radio buttons to choose HMM type.
+        hmm_frame = tk.Frame(top_frame)
+        hmm_frame.pack(side=tk.LEFT, padx=20)
+        tk.Label(hmm_frame, text="HMM Model Type:").pack(side=tk.TOP)
+        tk.Radiobutton(hmm_frame, text="Constrained", variable=self.hmm_option, value="constrained").pack(side=tk.LEFT)
+        tk.Radiobutton(hmm_frame, text="Unconstrained", variable=self.hmm_option, value="unconstrained").pack(side=tk.LEFT)
+        switch_hmm_btn = tk.Button(top_frame, text="Switch HMM Model", command=self.switch_hmm_model)
+        switch_hmm_btn.pack(side=tk.LEFT, padx=10)
         
         # Log output area.
         log_frame = tk.Frame(self)
@@ -107,7 +158,7 @@ class EEGAnalysisGUI(tk.Tk):
         self.log_text = ScrolledText(log_frame, height=10, state=tk.NORMAL)
         self.log_text.pack(fill=tk.X, expand=True)
         
-        # Middle frame: automata display (left) & interval plot (right).
+        # Middle frame: Automata display (left) and interval plot (right).
         display_frame = tk.Frame(self)
         display_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.automata_frame = tk.Frame(display_frame, borderwidth=2, relief=tk.GROOVE)
@@ -131,8 +182,7 @@ class EEGAnalysisGUI(tk.Tk):
     def load_and_run_analysis(self):
         # Prompt for file selection with clear dialog titles.
         self.eeg_file = filedialog.askopenfilename(
-            title="Select EEG file (.set)",
-            filetypes=[("EEG files", "*.set"), ("All files", "*.*")]
+            title="Select EEG file (.set)", filetypes=[("EEG files", "*.set"), ("All files", "*.*")]
         )
         if not self.eeg_file:
             messagebox.showerror("Error", "No EEG file selected!")
@@ -140,8 +190,7 @@ class EEGAnalysisGUI(tk.Tk):
         self.log(f"EEG file selected: {self.eeg_file}")
         
         self.channels_file = filedialog.askopenfilename(
-            title="Select Channels file (.tsv)",
-            filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")]
+            title="Select Channels file (.tsv)", filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")]
         )
         if self.channels_file:
             self.log(f"Channels file selected: {self.channels_file}")
@@ -149,8 +198,7 @@ class EEGAnalysisGUI(tk.Tk):
             self.log("No Channels file selected.")
         
         self.electrodes_file = filedialog.askopenfilename(
-            title="Select Electrodes file (.tsv)",
-            filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")]
+            title="Select Electrodes file (.tsv)", filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")]
         )
         if self.electrodes_file:
             self.log(f"Electrodes file selected: {self.electrodes_file}")
@@ -197,11 +245,10 @@ class EEGAnalysisGUI(tk.Tk):
             # Schedule ICA component plotting in the main thread.
             self.after(0, lambda: ica.plot_components())
             self.thread_safe_log("Displaying ICA component figures...")
-            time.sleep(0.5)  # Give a moment for figures to appear.
+            time.sleep(0.5)  # Give time for figures to appear.
             self.ica_for_exclusion = ica
-            # Generate a virtual event to show the exclusion dialog.
             self.event_generate("<<ShowExclusion>>", when="tail")
-            self.ica_exclusion_event.wait()  # Wait until user input.
+            self.ica_exclusion_event.wait()
             exclude_list = self.ica_exclusion_result
             self.thread_safe_log(f"Excluding ICA components: {exclude_list}")
             ica.exclude = exclude_list
@@ -217,31 +264,33 @@ class EEGAnalysisGUI(tk.Tk):
             ev_df = pd.DataFrame({'time': ev_times, 'label': ev_labels})
             self.thread_safe_log("Events extracted:")
             self.thread_safe_log(ev_df.to_string())
-            ev_df = ev_df.iloc[5:].reset_index(drop=True)
+            # Remove the initial epochs until "prebase" is reached.
+            prebase_indices = ev_df[ev_df['label'].str.strip().str.lower() == "prebase"].index
+            if len(prebase_indices) > 0:
+                ev_df = ev_df.iloc[prebase_indices[0]:].reset_index(drop=True)
+            else:
+                self.thread_safe_log("No 'prebase' event found; using all events.")
             self.ev_df = ev_df
             
-            # --- Create a "prebase" interval if it exists.
+            # --- Create a "prebase" interval: start at the prebase event and end 120 sec later.
             prebase_interval = None
-            # Use case-insensitive matching to avoid issues with letter case.
-            prebase_indices = ev_df[ev_df['label'].str.lower() == "prebase"].index
-            if len(prebase_indices) > 0 and prebase_indices[0] < len(ev_df) - 1:
+            prebase_indices = ev_df[ev_df['label'].str.strip().str.lower() == "prebase"].index
+            if len(prebase_indices) > 0:
                 prebase_idx = prebase_indices[0]
-                prebase_interval = (ev_df.loc[prebase_idx, 'time'], ev_df.loc[prebase_idx + 1, 'time'])
+                start_time = ev_df.loc[prebase_idx, 'time']
+                prebase_interval = (start_time, start_time + 120)
                 self.thread_safe_log(f"Prebase interval: {prebase_interval}")
             
             # --- Filter for events that are only "press1" or "exit".
             filtered_events = ev_df[ev_df['label'].isin(["press1", "exit"])].reset_index(drop=True)
             self.thread_safe_log("Filtered events (only press1 and exit):")
             self.thread_safe_log(filtered_events.to_string())
-
-            # Create temporary lists that begin with the prebase interval if it exists.
+            
             temp_intervals = []
             temp_labels = []
             if prebase_interval is not None:
                 temp_intervals.append(prebase_interval)
                 temp_labels.append("prebase")
-
-            # Loop through the filtered events to build the remaining intervals.
             for i in range(len(filtered_events) - 1):
                 current_label = filtered_events.loc[i, 'label']
                 next_label = filtered_events.loc[i+1, 'label']
@@ -258,15 +307,12 @@ class EEGAnalysisGUI(tk.Tk):
                 elif current_label == "exit" and next_label == "press1":
                     temp_intervals.append((start_time, end_time))
                     temp_labels.append("relaxed")
-
-            # Replace the original lists with the newly built ones.
             self.intervals = temp_intervals
             self.interval_labels = temp_labels
-
             self.thread_safe_log("Identified emotion intervals (in seconds):")
             self.thread_safe_log(str(self.intervals))
             
-            # --- Feature Extraction: Use ThreadPoolExecutor with 10 workers.
+            # --- Feature Extraction using multithreading.
             def compute_wavelet_features(epoch, sfreq,
                                          bands={'delta': (1,4),
                                                 'theta': (4,8),
@@ -307,8 +353,21 @@ class EEGAnalysisGUI(tk.Tk):
             self.thread_safe_log("Features normalized and scaled.")
             
             n_emotional_states = 3
-            self.model = hmm.GaussianHMM(n_components=n_emotional_states, covariance_type="full",
-                                         n_iter=400, random_state=37)
+            
+            # --- Choose constrained vs unconstrained HMM based on radio selection.
+            if self.hmm_option.get() == "constrained":
+                mask = np.array([[0, 1, 1],
+                 [1, 0, 0],
+                 [1, 0, 0]])
+                self.thread_safe_log("Using constrained HMM with transition mask:")
+                self.thread_safe_log(str(mask))
+                self.model = ConstrainedGaussianHMM(mask, n_components=n_emotional_states,
+                                     covariance_type="full", n_iter=400, random_state=37)
+            else:
+                self.thread_safe_log("Using unconstrained HMM.")
+                self.model = hmm.GaussianHMM(n_components=n_emotional_states,
+                                             covariance_type="full", n_iter=400, random_state=37)
+                                             
             self.model.fit(self.features_scaled)
             self.hidden_states = self.model.predict(self.features_scaled)
             self.thread_safe_log(f"Predicted hidden state indices: {self.hidden_states}")
@@ -321,11 +380,9 @@ class EEGAnalysisGUI(tk.Tk):
             self.thread_safe_log(f"Error during background processing: {e}")
     
     def handle_show_exclusion(self, event):
-        # This handler runs in the main thread.
         self.show_exclusion_dialog(self.ica_for_exclusion)
     
     def show_exclusion_dialog(self, ica):
-        # Create a non-modal Toplevel window for ICA exclusion input.
         top = tk.Toplevel(self)
         top.title("ICA Exclusion")
         tk.Label(top, text="Enter comma-separated integer indices for ICA components to exclude:").pack(padx=10, pady=10)
@@ -358,22 +415,17 @@ class EEGAnalysisGUI(tk.Tk):
     def draw_automata(self, highlight_state=None):
         ax = self.automata_ax
         ax.clear()
-        # Layout: state 0 at (3,2); state 1 at (1,2); state 2 at (5,2)
         positions = {0: (3,2), 1: (1,2), 2: (5,2)}
         radius = 0.7
         for state, pos in positions.items():
             circle = plt.Circle(pos, radius, color='black', fill=False, lw=3)
             ax.add_patch(circle)
             ax.text(pos[0], pos[1], f"{state}", fontsize=20, fontweight='bold', ha='center', va='center')
-        # Remove "Start" label and its arrow.
-        # Draw arrows between state 0 and state 1, state 0 and state 2.
-        # Compute arrow endpoints so they start at boundaries.
-        # Arrow between state 0 and 1:
+        # Draw bidirectional arrows between state 0 and state 1, and state 0 and state 2.
         vec_0_to_1 = np.array(positions[1]) - np.array(positions[0])
         norm_0_to_1 = vec_0_to_1 / np.linalg.norm(vec_0_to_1)
         arrow_start_0_1 = tuple(np.array(positions[0]) + radius * norm_0_to_1)
         arrow_end_0_1   = tuple(np.array(positions[1]) - radius * norm_0_to_1)
-        # Arrow between state 0 and 2:
         vec_0_to_2 = np.array(positions[2]) - np.array(positions[0])
         norm_0_to_2 = vec_0_to_2 / np.linalg.norm(vec_0_to_2)
         arrow_start_0_2 = tuple(np.array(positions[0]) + radius * norm_0_to_2)
@@ -410,7 +462,6 @@ class EEGAnalysisGUI(tk.Tk):
         self.interval_ax.clear()
         self.interval_ax.plot(times, mean_signal, label=f"Annotated: {annotated_label}", color="blue")
         self.interval_ax.set_title(f"Interval {index+1} | Predicted State: {predicted_state}")
-        # Force legend to the top.
         self.interval_ax.legend(loc="upper center")
         self.interval_canvas.draw()
         
